@@ -6,8 +6,6 @@ Runs systematic attacks using the official red teaming datasets
 import logging
 from pathlib import Path
 import sys
-import json
-import time
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -15,43 +13,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.agent_client import AgentClient
 from src.orchestrator import RedTeamOrchestrator
 from src.dataset_loader import DatasetLoader, KnowledgeBaseManager
-from src.evaluator import ResponseEvaluator
-from tqdm import tqdm
+from src.visualizer import ResultVisualizer
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-def calculate_asr(results, agent_name):
-    """Calculate Attack Success Rate from results"""
-    total = len(results)
-    successful = sum(1 for r in results if r['evaluation'].get('is_vulnerable', False))
-    
-    by_category = {}
-    for result in results:
-        category = result['attack_category']
-        if category not in by_category:
-            by_category[category] = {'total': 0, 'successful': 0}
-        by_category[category]['total'] += 1
-        if result['evaluation'].get('is_vulnerable', False):
-            by_category[category]['successful'] += 1
-    
-    for category in by_category:
-        by_category[category]['asr'] = (
-            by_category[category]['successful'] / by_category[category]['total']
-            if by_category[category]['total'] > 0 else 0
-        )
-    
-    return {
-        'agent': agent_name,
-        'total_attacks': total,
-        'successful_attacks': successful,
-        'overall_asr': successful / total if total > 0 else 0,
-        'by_category': by_category
-    }
 
 
 def run_dataset_attacks(agent_name: str = "bear", 
@@ -70,10 +38,11 @@ def run_dataset_attacks(agent_name: str = "bear",
     logger.info("=" * 80)
     
     # Initialize components
-    client = AgentClient()
+    config = Config()
+    client = AgentClient(config)
+    orchestrator = AttackOrchestrator(client, config)
     dataset_loader = DatasetLoader()
     kb_manager = KnowledgeBaseManager()
-    evaluator = ResponseEvaluator()
     
     # Load datasets
     logger.info("\n📊 Loading official red teaming datasets...")
@@ -110,79 +79,34 @@ def run_dataset_attacks(agent_name: str = "bear",
     # Run dataset attacks
     logger.info(f"\n🚀 Launching attacks against {agent_name}...")
     
-    results = []
+    # Add dataset attacks to orchestrator
+    for attack in dataset_attacks:
+        orchestrator.attacks.append(attack)
     
-    # Run dataset attacks
-    for attack in tqdm(dataset_attacks, desc=f"Testing {agent_name}"):
-        try:
-            # Send attack
-            response = client.send_message(agent_name, attack['prompt'])
-            
-            # Evaluate response
-            eval_result = evaluator.evaluate_response(
-                agent_name=agent_name,
-                attack_category=attack['category'],
-                attack_name=attack['name'],
-                prompt=attack['prompt'],
-                response=response.response
-            )
-            
-            # Store result
-            result = {
-                'agent_name': agent_name,
-                'attack_category': attack['category'],
-                'attack_name': attack['name'],
-                'prompt': attack['prompt'],
-                'response': response.response,
-                'evaluation': eval_result.to_dict(),
-                'metadata': attack.get('metadata', {})
-            }
-            results.append(result)
-            
-            # Small delay to avoid rate limiting
-            time.sleep(0.5)
-            
-        except Exception as e:
-            logger.error(f"Error with attack {attack['name']}: {e}")
-            continue
-    
-    # Run custom attacks if requested
+    # Run attacks (include custom if requested)
     if include_custom_attacks:
-        logger.info(f"\n🚀 Running custom attacks...")
-        orchestrator = RedTeamOrchestrator()
-        custom_results = orchestrator.run_red_team_suite([agent_name], delay=0.5)
-        
-        # Add to results
-        for res in custom_results:
-            results.append({
-                'agent_name': res['agent'],
-                'attack_category': res['attack_category'],
-                'attack_name': res['attack_name'],
-                'prompt': res['prompt'],
-                'response': res['response'],
-                'evaluation': res['evaluation'],
-                'metadata': {}
-            })
+        # Add custom attacks
+        from src.attacks import AttackGenerator
+        custom_attacks = AttackGenerator.get_all_attacks()
+        for attack in custom_attacks:
+            orchestrator.attacks.append(attack.to_dict())
+        results = orchestrator.run_all_attacks(agent_name)
+    else:
+        # Run only dataset attacks
+        orchestrator.attacks = dataset_attacks
+        results = orchestrator.run_all_attacks(agent_name)
     
     # Save results
     logger.info("\n💾 Saving results...")
-    result_file = Path("results") / f"attack_results_dataset_{agent_name}.json"
-    result_file.parent.mkdir(exist_ok=True)
-    
-    with open(result_file, 'w') as f:
-        json.dump({
-            'agent': agent_name,
-            'total_attacks': len(results),
-            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-            'results': results
-        }, f, indent=2)
+    result_file = orchestrator.save_results(agent_name)
     logger.info(f"  • Results saved to: {result_file}")
     
     # Generate ASR report
     logger.info("\n📊 Generating ASR report...")
-    asr_report = calculate_asr(results, agent_name)
-    report_file = Path("results") / f"asr_report_dataset_{agent_name}.json"
+    asr_report = orchestrator.calculate_asr(results)
+    report_file = Path("results") / "asr_report_dataset.json"
     
+    import json
     with open(report_file, 'w') as f:
         json.dump(asr_report, f, indent=2)
     logger.info(f"  • ASR report saved to: {report_file}")
@@ -204,14 +128,48 @@ def run_dataset_attacks(agent_name: str = "bear",
     logger.info("\n📚 Updating knowledge base...")
     kb_manager.load()
     
+    # Extract detected characteristics from results
+    framework_detected = None
+    model_detected = None
+    company_detected = None
+    
+    for result in results:
+        eval_result = result.get('evaluation', {})
+        if eval_result.get('framework_detected'):
+            framework_detected = eval_result.get('framework_detected')
+        if eval_result.get('model_detected'):
+            model_detected = eval_result.get('model_detected')
+        if eval_result.get('company_detected'):
+            company_detected = eval_result.get('company_detected')
+    
+    if framework_detected or model_detected or company_detected:
+        kb_manager.update_agent_characteristics(
+            agent_name,
+            framework=framework_detected,
+            model=model_detected,
+            company=company_detected
+        )
+    
     # Add vulnerabilities
     for result in results:
-        if result['evaluation'].get('is_vulnerable', False):
-            vuln_desc = f"{result['attack_category']}: {result['attack_name']}"
+        if result.get('evaluation', {}).get('is_vulnerable', False):
+            vuln_desc = f"{result['category']}: {result['attack']}"
             kb_manager.add_vulnerability(agent_name, vuln_desc)
     
     kb_manager.save()
     logger.info(f"  • Knowledge base updated for {agent_name}")
+    
+    # Generate visualizations
+    logger.info("\n📊 Generating visualizations...")
+    visualizer = ResultVisualizer()
+    
+    try:
+        viz_files = visualizer.create_all_visualizations(results, agent_name)
+        logger.info("  • Visualizations created:")
+        for viz_file in viz_files:
+            logger.info(f"    - {viz_file}")
+    except Exception as e:
+        logger.warning(f"  • Could not generate visualizations: {e}")
     
     logger.info("\n" + "=" * 80)
     logger.info("✅ DATASET-DRIVEN ATTACK COMPLETED")
@@ -283,6 +241,7 @@ def run_comparative_analysis(limit_per_agent: int = 5):
                    f"({item['successful_attacks']}/{item['total_attacks']} attacks succeeded)")
     
     # Save comparative report
+    import json
     comparative_file = Path("results") / "comparative_analysis.json"
     with open(comparative_file, 'w') as f:
         json.dump({
