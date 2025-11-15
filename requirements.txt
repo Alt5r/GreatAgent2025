@@ -1,0 +1,20 @@
+# Core dependencies
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+
+# Data visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Progress tracking
+tqdm>=4.65.0
+
+# LLM and AI
+anthropic>=0.18.0
+openai>=1.10.0
+
+# Optional - for advanced features
+langchain>=0.1.0
+langchain-community>=0.0.20
